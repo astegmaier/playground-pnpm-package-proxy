@@ -18,7 +18,7 @@ echo 'registry=https://packagefeedproxy.microsoft.io/npm/' >> ~/.npmrc
 
 # 2. Install ANY pnpm 11.x globally EXCEPT the version this repo pins (11.10.0).
 #    A different version is required — pnpm only version-switches on a mismatch.
-npm install -g pnpm@11.17.0
+npm install -g pnpm@11.15.1
 
 # 3. Reproduce
 git clone <this repo>
@@ -157,6 +157,6 @@ Items 1 and 2 are independent — both are needed.
 
 ## Notes
 
-- Reproduced with pnpm 11.17.0 (global) against a repo pinning pnpm 11.10.0, on macOS arm64.
+- Reproduced with pnpm 11.15.1 (global) against a repo pinning pnpm 11.10.0, on macOS arm64.
 - If your global pnpm already *is* the pinned version, no switch occurs and no error appears — install a different 11.x to reproduce.
 - The missing signatures also disable `npm audit signatures` for any package fetched through the proxy.
