@@ -149,14 +149,150 @@ A repository whose lockfile was generated against the public registry passes che
 
 1. Serve `dist.tarball` on the same host and path shape as the registry (`https://packagefeedproxy.microsoft.io/npm/<name>/-/<name>-<version>.tgz`), or redirect from it.
 2. Pass `dist.signatures` through verbatim from upstream npm.
-3. Pass `dist.integrity` through as well, so lockfiles do not silently downgrade to SHA-1.
+3. Pass `dist.integrity` through as well, so lockfiles do not silently downgrade to SHA-1 — and because pnpm 12.x rejects a package manager with no integrity outright.
 
-Items 1 and 2 are independent — both are needed.
+Items 1 and 2 are independent — both are needed. See [The upstream PRs behind this](#the-upstream-prs-behind-this) for which change enforces which.
+
+---
+
+## Which pnpm versions are affected
+
+Version pinning has existed for far longer than this breakage. The two checks above are recent, so there is a wide band of pnpm versions that self-install correctly behind the proxy.
+
+### When the feature appeared
+
+Automatic version switching landed in **pnpm 9.7.0** ([#8363](https://github.com/pnpm/pnpm/pull/8363), commit `26b065c`, which added `pnpm/src/switchCliVersion.ts`). It was opt-in there, behind `manage-package-manager-versions=true`, and became the default in **10.0.0** (commit `dfcf034`, `feat!: set manage-package-manager-versions to true`). pnpm 9.6.0 and earlier ignore `packageManager` entirely.
+
+### When it started failing
+
+Both checks were added on the same day and shipped in the same release, **11.5.3**:
+
+| Check | Commit / PR | First release |
+| --- | --- | --- |
+| Registry package path + integrity-only resolution | `822beb5` / [#12296](https://github.com/pnpm/pnpm/pull/12296) | 11.5.3 |
+| npm registry signature verification | `5f2bb9f` / [#12292](https://github.com/pnpm/pnpm/pull/12292) | 11.5.3 |
+
+Both PRs are analysed in [The upstream PRs behind this](#the-upstream-prs-behind-this) below.
+
+So **9.7.0 through 11.5.2 self-install fine behind the proxy; 11.5.3 and later do not.**
+
+### Measured results
+
+Global pnpm installed via `npm install -g pnpm@<version>`, run against this repo (which pins `pnpm@11.10.0`), macOS arm64, registry `https://packagefeedproxy.microsoft.io/npm/`:
+
+| Global pnpm | Result |
+| --- | --- |
+| 9.6.0 | no switch — feature absent, prints `9.6.0` |
+| 9.7.0 | switches to 11.10.0 |
+| 10.0.0 | switches to 11.10.0 |
+| 11.5.2 | switches to 11.10.0 |
+| 11.5.3 | fails — `must use a registry package path and an integrity-only resolution` |
+| 11.15.1, 11.16.0 | fails — same |
+| 12.0.0-alpha.18 | fails — `Cannot resolve pnpm@11.10.0 as a package manager dependency because it has no integrity` |
+
+The 12.x alpha surfaces a third variant of the same root cause: the proxy's missing `dist.integrity` is now itself a hard error, rather than silently degrading to SHA-1.
+
+### Isolating check 2
+
+Behind `packagefeedproxy.microsoft.io` only **check 1** ever fires, because the tarball host never matches the registry host — so the signature check is unreachable there and the two defects cannot be told apart from the error message alone.
+
+They can be separated using the underlying feed directly, `https://ms-feed-12.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/`. That registry serves a `dist.tarball` that *is* canonical for itself, but still carries no `dist.signatures`. Check 1 then passes and check 2 fires:
+
+```
+[ERROR] Refusing to run pnpm@11.10.0: its npm registry signature could not be verified
+(@pnpm/exe@11.10.0: @pnpm/exe@11.10.0 has no registry signature;
+ @pnpm/macos-arm64@11.10.0: @pnpm/macos-arm64@11.10.0 has no registry signature;
+ pnpm@11.10.0: pnpm@11.10.0 has no registry signature).
+The bytes selected by this project's lockfile/registry do not match a published,
+signed pnpm release.
+```
+
+On that same registry, 9.7.0 / 10.0.0 / 11.5.2 all self-install successfully — confirming both checks are new in 11.5.3, and that fixing only the tarball URL would leave pinning broken.
+
+### Two traps when reproducing this
+
+- **The signature check only runs on a real download.** `installPnpmToStore` returns early if the engine is already in the global virtual store, at `~/Library/pnpm/store/v11/links/@/pnpm/<version>/<hash>/`. Clearing `~/Library/pnpm/.tools`, `~/Library/pnpm/package-manager-store` and `~/Library/Caches/pnpm` is *not* sufficient — that store entry must be removed too, or the switch silently succeeds from cache. The hash includes the registry, so changing registries also produces a cache miss.
+- **You cannot redirect the bootstrap from the command line.** Neither `--registry=…` nor `npm_config_registry=…` changed which registry the pinned pnpm was resolved from (tested on 11.5.3 and 11.15.1 with all caches cleared); a repo-local `.npmrc` is ignored as well. Only the user-level `~/.npmrc` steers it. That is deliberate — see [#12296](https://github.com/pnpm/pnpm/pull/12296) below — but it means the usual "just point at npmjs.org for this one command" workaround is unavailable.
+
+---
+
+## The upstream PRs behind this
+
+Both checks come from two pull requests by pnpm's maintainer `zkochan`, merged less than an hour apart on 2026-06-09 and released together in 11.5.3. Neither targets proxies; both are hardening the same threat model, and this proxy happens to be indistinguishable from the attacker they describe.
+
+### [#12292](https://github.com/pnpm/pnpm/pull/12292) — `fix(security): verify npm registry signature before spawning a package-manager binary`
+
+Merge commit [`5f2bb9f`](https://github.com/pnpm/pnpm/commit/5f2bb9f5ba01d498e03eb54a0d72d185fe3d0aca), 21 files changed. This is **check 2**.
+
+The PR's stated problem is that pnpm can be made to download and execute a native binary through two repository-controlled inputs — the pacquet install engine declared in `configDependencies`, and the `packageManager` / `devEngines.packageManager` version switch, which is on by default. As the PR puts it, the repository also controls the lockfile integrity and the registry the bytes come from, so *"matching the lockfile integrity proves nothing — it matches the hash the attacker wrote."*
+
+What it added:
+
+- `deps/security/signatures/src/verifySignatures.ts` — `verifyInstalledPackageSignatures()`, which validates `name@version:integrity` against `dist.signatures`.
+- `deps/security/signatures/src/npmSigningKeys.ts` — npm's public signing keys, **embedded in the CLI** rather than fetched, explicitly modelled on corepack. The PR states there is intentionally *"no runtime override or off-switch"* for them, so a registry the user did not vouch for cannot supply its own keypair.
+- `engine/pm/commands/src/self-updater/verifyPnpmEngineIdentity.ts` — the pnpm-engine wrapper that emits the `Refusing to run pnpm@…` error. It verifies `pnpm`, `@pnpm/exe`, and the host platform binary.
+- `installing/commands/src/verifyPacquetIdentity.ts` — the same treatment for the pacquet engine.
+- A `deps/security/signatures/scripts/update-npm-signing-keys.mjs` script wired into the `create-release-pr` workflow, so an npm key rotation blocks the release rather than silently breaking verification.
+
+Two design decisions in this PR are what make it bite here:
+
+1. **It fails closed.** Any outcome other than a valid signature — invalid, absent, or registry unreachable — refuses the switch. "No signature" and "unsigned bytes from an attacker" are the same observation. The proxy's packuments have no `dist.signatures` at all, so they land in exactly that bucket.
+2. **It runs only on a store cache miss.** The PR notes this is a deliberate performance trade-off, *"so it adds no network round trip to every command."* That is also why this failure is intermittent-looking in practice: once any pnpm version has populated the global virtual store for a given registry, later invocations skip verification entirely.
+
+The PR explicitly claims mirrors are fine — *"an **npm mirror works transparently** — it proxies the same signed packument, with no configuration."* That assumption is precisely what `packagefeedproxy.microsoft.io` violates: it proxies the tarballs faithfully but drops the signatures from the packument.
+
+### [#12296](https://github.com/pnpm/pnpm/pull/12296) — `fix: harden package-manager bootstrap metadata`
+
+Merge commit [`822beb5`](https://github.com/pnpm/pnpm/commit/822beb5fa0458a041f2833d452f8dc6b59b1f1cd), 12 files changed. This is **check 1**, and it is the error this repo actually reproduces.
+
+Its summary describes two related changes:
+
+- Resolve package-manager bootstrap metadata through **trusted user/CLI registries and trusted network config**, defaulting to the public npm registry instead of project/workspace registry settings, *"so repository `.npmrc` proxy/TLS/configByUri values cannot steer package-manager bootstrap traffic."* This is `pnpm/src/packageManagerRegistries.ts`, whose `DEFAULT_PACKAGE_MANAGER_REGISTRY` is hard-coded to `https://registry.npmjs.org/`.
+- Validate the env-lockfile entries before installing or executing: *"dependency paths must be registry package paths and package records must use integrity-only resolutions."* This is `pnpm/src/packageManagerLockfile.ts`.
+
+The validation is strict in a way that matters here. `assertIntegrityOnlyResolution()` requires the resolution object to have **exactly one key**, `integrity`:
+
+```ts
+const resolutionKeys = Object.keys(resolution)
+if (
+  resolutionKeys.length !== 1 ||
+  resolutionKeys[0] !== 'integrity' ||
+  ...
+) {
+  throw invalidPackageManagerLockfile(depPath)
+}
+```
+
+A `tarball` field is not merely distrusted — its presence alone is fatal. And `toLockfileResolution()` only omits `tarball` when `isCanonicalRegistryTarballUrl()` holds, i.e. when the URL equals `getNpmTarballUrl(name, version, { registry })`. Because the proxy serves packuments from `packagefeedproxy.microsoft.io` and tarballs from `ms-feed-N.pkgs.visualstudio.com`, that equality can never hold, so the URL is always retained and the assertion always fires.
+
+The first bullet is also why the ordinary escape hatches are gone. The bootstrap deliberately reads only non-project config, and in practice (see the traps above) not even `--registry` or `npm_config_registry` redirected it in our testing — leaving the user-level `~/.npmrc` as the only lever.
+
+### [#12394](https://github.com/pnpm/pnpm/pull/12394) — `fix: sync pacquet lockfile output with pnpm`
+
+Merge commit [`baf1502`](https://github.com/pnpm/pnpm/commit/baf15021ec134d55a604b1af42552d670957e4fa), merged 2026-06-14. Not one of the two checks, but it is where the third, distinct 12.x error comes from. The Rust env-installer in `pacquet/crates/env-installer/src/resolve_package_manager_integrities.rs` now rejects a package-manager dependency that has no integrity outright:
+
+```
+Cannot resolve pnpm@11.10.0 as a package manager dependency because it has no integrity
+```
+
+Under the old behaviour the missing `dist.integrity` silently degraded to a SHA-1 derived from `shasum`. In 12.x that degradation is gone, so the proxy's third defect — stripped `dist.integrity` — becomes a hard failure in its own right, independently of the tarball URL and the signatures.
+
+### What this means for the fix list
+
+The two PRs are independent controls over independent properties, which is why fixing one of them is not enough:
+
+| Proxy defect | Trips | Introduced by |
+| --- | --- | --- |
+| `dist.tarball` on a different host | check 1 | [#12296](https://github.com/pnpm/pnpm/pull/12296) |
+| `dist.signatures` stripped | check 2 | [#12292](https://github.com/pnpm/pnpm/pull/12292) |
+| `dist.integrity` stripped | 12.x hard error (SHA-1 downgrade before that) | [#12394](https://github.com/pnpm/pnpm/pull/12394) |
+
+Restoring only the canonical tarball URL moves the failure from check 1 to check 2, as demonstrated above with the direct `ms-feed-12` feed. All three fields have to be passed through.
 
 ---
 
 ## Notes
 
 - Reproduced with pnpm 11.15.1 (global) against a repo pinning pnpm 11.10.0, on macOS arm64.
-- If your global pnpm already *is* the pinned version, no switch occurs and no error appears — install a different 11.x to reproduce.
+- If your global pnpm already *is* the pinned version, no switch occurs and no error appears — install a different pnpm ≥ 11.5.3 to reproduce.
 - The missing signatures also disable `npm audit signatures` for any package fetched through the proxy.
