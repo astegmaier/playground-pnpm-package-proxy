@@ -6,6 +6,16 @@ Minimal reproduction of a bug in the npm proxy at `https://packagefeedproxy.micr
 
 The proxy serves **authentic, byte-identical package tarballs**, but its packument metadata differs from the public npm registry in two ways, and pnpm depends on both.
 
+## Contents
+
+1. [Reproduce](#1-reproduce)
+2. [What the proxy returns vs. the public registry](#2-what-the-proxy-returns-vs-the-public-registry)
+3. [Why pnpm needs these fields](#3-why-pnpm-needs-these-fields)
+4. [What would fix this](#4-what-would-fix-this)
+5. [Which pnpm versions are affected](#5-which-pnpm-versions-are-affected)
+6. [The upstream PRs behind this](#6-the-upstream-prs-behind-this)
+7. [Notes](#7-notes)
+
 ---
 
 ## 1. Reproduce
@@ -145,17 +155,17 @@ A repository whose lockfile was generated against the public registry passes che
 
 ---
 
-## What would fix this
+## 4. What would fix this
 
 1. Serve `dist.tarball` on the same host and path shape as the registry (`https://packagefeedproxy.microsoft.io/npm/<name>/-/<name>-<version>.tgz`), or redirect from it.
 2. Pass `dist.signatures` through verbatim from upstream npm.
 3. Pass `dist.integrity` through as well, so lockfiles do not silently downgrade to SHA-1 — and because pnpm 12.x rejects a package manager with no integrity outright.
 
-Items 1 and 2 are independent — both are needed. See [The upstream PRs behind this](#the-upstream-prs-behind-this) for which change enforces which.
+Items 1 and 2 are independent — both are needed. See [The upstream PRs behind this](#6-the-upstream-prs-behind-this) for which change enforces which.
 
 ---
 
-## Which pnpm versions are affected
+## 5. Which pnpm versions are affected
 
 Version pinning has existed for far longer than this breakage. The two checks above are recent, so there is a wide band of pnpm versions that self-install correctly behind the proxy.
 
@@ -172,7 +182,7 @@ Both checks were added on the same day and shipped in the same release, **11.5.3
 | Registry package path + integrity-only resolution | `822beb5` / [#12296](https://github.com/pnpm/pnpm/pull/12296) | 11.5.3 |
 | npm registry signature verification | `5f2bb9f` / [#12292](https://github.com/pnpm/pnpm/pull/12292) | 11.5.3 |
 
-Both PRs are analysed in [The upstream PRs behind this](#the-upstream-prs-behind-this) below.
+Both PRs are analysed in [The upstream PRs behind this](#6-the-upstream-prs-behind-this) below.
 
 So **9.7.0 through 11.5.2 self-install fine behind the proxy; 11.5.3 and later do not.**
 
@@ -216,7 +226,7 @@ On that same registry, 9.7.0 / 10.0.0 / 11.5.2 all self-install successfully —
 
 ---
 
-## The upstream PRs behind this
+## 6. The upstream PRs behind this
 
 Both checks come from two pull requests by pnpm's maintainer `zkochan`, merged less than an hour apart on 2026-06-09 and released together in 11.5.3. Neither targets proxies; both are hardening the same threat model, and this proxy happens to be indistinguishable from the attacker they describe.
 
@@ -291,7 +301,7 @@ Restoring only the canonical tarball URL moves the failure from check 1 to check
 
 ---
 
-## Notes
+## 7. Notes
 
 - Reproduced with pnpm 11.15.1 (global) against a repo pinning pnpm 11.10.0, on macOS arm64.
 - If your global pnpm already *is* the pinned version, no switch occurs and no error appears — install a different pnpm ≥ 11.5.3 to reproduce.
