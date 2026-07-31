@@ -275,6 +275,10 @@ curl -s -o /dev/null -w '%{http_code}\n' https://packagefeedproxy.microsoft.io/n
 # => 404
 ```
 
+**An important qualification on convention 2, and on what "following the convention" would achieve.** This guidance is written for registries that *publish and sign their own* packages. Satisfying it by minting Azure signatures under an Azure key and serving that key at `/-/npm/v1/keys` would **not** fix pnpm's self-install, because pnpm's package-manager path does not consult that endpoint at all — see [5.9](#59-a-legitimate-criticism-of-pnpms-design). It would help `npm audit signatures`, which does fetch registry keys, but it would not unblock version pinning.
+
+What unblocks pnpm is **mirroring npm's signatures verbatim**, which is a different action from "implementing the convention". Verdaccio — the reference open-source npm proxy — takes exactly this route: it passes signatures through, mints none of its own, and returns 404 for `/-/npm/v1/keys` (see [5.7](#57-other-registries-preserve-this-metadata)). The request in this document is for passthrough, not for Azure to become a signer.
+
 The wording is "supports … *if* the following conventions are followed", which describes an opt-in capability rather than an obligation. The practical consequence of not opting in is set out in section 5.5: three widely deployed clients stop working.
 
 ### 5.4 `dist.integrity` is what the signature is computed over
@@ -368,12 +372,48 @@ That the behaviour is not unique does not make it correct, and the reference ope
 | "This is a proxy, not a signing registry; it cannot sign with npm's keys." | No signing is requested. The request is to pass npm's existing signatures through, as Verdaccio does. The `keyid` field identifies npm as the signer. |
 | "Byte-identical tarballs cannot be guaranteed, so npm's signatures might not validate." | Testable, and tested: the SHA-512 of the proxied tarball equals npm's signed `dist.integrity` exactly ([section 2](#2-what-the-proxy-returns-vs-the-public-registry)). The bytes are identical; only the metadata is dropped. |
 | "Feeds mix upstreams, so partial signatures would mislead." | Packages sourced from npmjs.org can carry their npm signatures; packages published directly to the feed simply have none. That is the position of every mixed registry, and it is what `keyid` disambiguates. |
+| "pnpm is verifying the wrong thing — a registry signature cannot attest that pnpm's maintainers published these bytes." | **Correct**, and addressed on its merits in [5.9](#59-a-legitimate-criticism-of-pnpms-design). It is an argument for pnpm changing its design; it does not change which action unblocks the feed's users today. |
 
-### 5.9 Where the fix belongs
+### 5.9 A legitimate criticism of pnpm's design
 
-**With Azure DevOps.** pnpm's behaviour here matches npm's published convention and Corepack's independent implementation of it, and failing closed is the correct choice for code that is about to be executed: to a verifier, "no signature" is indistinguishable from "unsigned bytes supplied by an attacker". The `shasum` the proxy does provide is not a substitute, because it attests only that the bytes match what the proxy says they should be, not that npm ever published them.
+The following objection has been raised against pnpm's mechanism, and it is substantially correct:
 
-There is no corresponding relaxation to ask of pnpm. Removing the check would reintroduce the vulnerability [#12292](https://github.com/pnpm/pnpm/pull/12292) was written to close, and would not help users of the npm CLI or Corepack, which apply the same requirement.
+> If pnpm wants to use a signature to verify the authenticity of pnpm, they should use a signature applied by pnpm's maintainers, with a private key that they control. Hard-coding npmjs's public keys is completely wrong — npm will necessarily periodically rotate their keys, and the repo signature doesn't give the guarantee they're looking for. The repo signature can say "these are bits that npmjs.org saw" but it can't say "these bits were uploaded by pnpm's maintainers".
+>
+> — Jonathan Myers, Azure DevOps
+
+Three parts of this hold up under examination:
+
+**a. A registry signature attests custody, not authorship.** The signed message is exactly `name@version:<integrity>` (`verifySignatures.ts`). It binds bytes to *npmjs.org having served them*; it says nothing about who published them. A compromised or coerced registry, or a takeover of a publisher account, produces bytes that satisfy this check.
+
+**b. Key rotation has already broken shipped binaries — this is not hypothetical.** pnpm's engine path uses keys embedded at build time and never fetches new ones, so a release cannot learn a key minted after it shipped. The release-time drift check protects *future* releases only. Exactly this failure occurred in the Corepack implementation of the same scheme in January 2025:
+
+- [nodejs/corepack#612](https://github.com/nodejs/corepack/issues/612) — *"Newly published versions of package managers distributed from npm cannot be installed due to key id mismatch"*, with `Error: Cannot find matching keyid` when installing pnpm 10.1.0.
+- [pnpm/pnpm#9029](https://github.com/pnpm/pnpm/issues/9029) — the same breakage reported against pnpm.
+
+pnpm's implementation is more tolerant than Corepack's — it accepts a package as soon as any one signature validates against a trusted key, so a dual-signed packument survives rotation — but that does not help a binary that has never seen the new key.
+
+**c. Stronger primitives were available.** pnpm already publishes with npm **provenance** attestations (`--provenance` in its release script, `.meta-updater/src/index.ts`), which bind an artifact to a source repository and CI workflow via Sigstore — the property actually wanted here. Separately, the Corepack `packageManager` syntax supports an integrity pin (`pnpm@9.5.0+sha512.…`) that requires trusting no registry signer at all; pnpm parses that suffix and **discards** it:
+
+```ts
+// Remove the integrity hash. Ex: "pnpm@9.5.0+sha512.1400368301…"
+const [version] = pmReference.split('+')
+```
+
+Where the objection overreaches: calling the approach "completely wrong" understates what it does accomplish. For the specific attack [#12292](https://github.com/pnpm/pnpm/pull/12292) targets — a cloned repository steering pnpm at a registry of its choosing and substituting the bytes of an executable — verifying against keys the *client* already trusts is a coherent and proportionate control, and deliberately refusing registry-supplied keys is the point rather than an oversight. A maintainer-held key would also have to be embedded in the pnpm binary, so it does not escape the bootstrap-trust problem; it changes *whose* compromise is fatal, not whether a hard-coded root exists. Corepack and `npm audit signatures` rely on the same convention, so pnpm is not an outlier.
+
+### 5.10 Where the fix belongs
+
+**With Azure DevOps, for the immediate problem.** This holds regardless of whether the criticism in 5.9 is accepted, because of an asymmetry that was verified experimentally:
+
+- Passing npm's `dist.signatures` and `dist.integrity` through unchanged **does** make pnpm's self-install work. Confirmed end to end against Verdaccio, which mirrors both fields and rewrites only `dist.tarball`.
+- A registry that instead mints its **own** signatures under its **own** key, and serves that key at `/-/npm/v1/keys` as npm's third-party guidance describes, **does not**. pnpm's engine path never requests that endpoint and rejects signatures from any key outside its embedded set. Verified by simulating a conformant third-party registry: the audit-style path accepted its signature, the engine-style path failed with "no corresponding public key", and the engine made no request to `/-/npm/v1/keys`.
+
+So "implement npm's third-party signing convention" and "mirror npm's signatures" are different actions with different outcomes, and only the second unblocks version pinning. Verbatim passthrough is also the cheaper of the two: it forwards metadata the feed already receives, rather than operating a signing key.
+
+**With pnpm, for the underlying design.** Independently of the above, 5.9 is a reasonable basis to ask pnpm to move the guarantee onto something the pnpm maintainers control — provenance attestation policy, a pnpm-held key, or honouring the `packageManager` integrity pin it currently discards — and to reduce the coupling between an installed pnpm binary and npm's current signing key. That change would also remove the constraint that any registry serving pnpm must be a verbatim npmjs.org metadata mirror, which is what makes the feature fragile for enterprise and air-gapped registries generally.
+
+What should *not* happen is simply removing the check: that reintroduces the vulnerability [#12292](https://github.com/pnpm/pnpm/pull/12292) closed, and would not help users of the npm CLI or Corepack, which apply the same requirement.
 
 ---
 
@@ -382,27 +422,28 @@ There is no corresponding relaxation to ask of pnpm. Removing the check would re
 | Defect in the packument | Client check it trips | Documented expectation? | Fix belongs with |
 | --- | --- | --- | --- |
 | `dist.tarball` on a different origin from the packument | pnpm's integrity-only resolution check ([#12296](https://github.com/pnpm/pnpm/pull/12296)) | **No.** No specification requires a canonical or same-host tarball URL, and pnpm accepts non-derivable URLs elsewhere. | **pnpm**, primarily — relax the rule. Azure DevOps secondarily, as portability hygiene. |
-| `dist.signatures` absent | pnpm signature verification ([#12292](https://github.com/pnpm/pnpm/pull/12292)), `npm audit signatures`, Corepack `verifySignature` | **Yes.** npm's published convention for third-party registries. | **Azure DevOps** |
+| `dist.signatures` absent | pnpm signature verification ([#12292](https://github.com/pnpm/pnpm/pull/12292)), `npm audit signatures`, Corepack `verifySignature` | **Yes.** npm's published convention for third-party registries. | **Azure DevOps** — pass through verbatim. See also the design criticism in [5.9](#59-a-legitimate-criticism-of-pnpms-design). |
 | `dist.integrity` absent | the above (nothing to sign over); pnpm 12.x rejects outright ([#12394](https://github.com/pnpm/pnpm/pull/12394)); SHA-1 lockfile downgrade before that | **Yes.** Documented since April 2017 and structurally required by the signing formula. | **Azure DevOps** |
 | `GET /{package}/{version}` returns 404 | Corepack, at its first request | **Yes.** Listed as a Package Endpoint in `REGISTRY-API.md`. | **Azure DevOps** |
-| `GET /-/npm/v1/keys` returns 404 | convention 2 for signature support | **Yes.** Named explicitly in npm's third-party registry convention. | **Azure DevOps** |
+| `GET /-/npm/v1/keys` returns 404 | `npm audit signatures` only — **not** pnpm's self-install | **Yes.** Named in npm's third-party registry convention. | **Azure DevOps**, but note this alone does not fix version pinning |
 
 ### Requested of pnpm
 
-Accept a stored `tarball` alongside `integrity` for package-manager dependencies, leaving signature verification unchanged (see [4.5](#45-where-the-fix-belongs)). This is the only change that unblocks existing users of registries whose tarball origin differs from their packument origin, without those registries shipping anything.
+1. **Issue A:** accept a stored `tarball` alongside `integrity` for package-manager dependencies, leaving signature verification unchanged (see [4.5](#45-where-the-fix-belongs)). This is the only change that unblocks existing users of registries whose tarball origin differs from their packument origin, without those registries shipping anything.
+2. **Issue B (design, not a blocker):** move the guarantee onto something pnpm's maintainers control — provenance attestation policy, a pnpm-held signing key, or honouring the `packageManager` integrity pin that pnpm currently parses and discards — so that verification no longer depends on a key embedded at build time, and no longer requires every registry serving pnpm to be a verbatim npmjs.org metadata mirror. Rationale and evidence in [5.9](#59-a-legitimate-criticism-of-pnpms-design).
 
 ### Requested of Azure DevOps
 
 For packages whose upstream is npmjs.org, pass the upstream `dist` object through unmodified except for `tarball`:
 
-1. `dist.signatures` — verbatim.
+1. `dist.signatures` — **verbatim, as received from npmjs.org.** Re-signing under an Azure key would not fix pnpm (see [5.10](#510-where-the-fix-belongs)).
 2. `dist.integrity` — verbatim. The signature is computed over this value, so item 1 is inert without it.
 3. `dist.tarball` — rewriting is expected; point it at the same endpoint that served the packument.
-4. Serve `GET /{package}/{version}` and `GET /-/npm/v1/keys`, both currently 404.
+4. Serve `GET /{package}/{version}` and `GET /-/npm/v1/keys`, both currently 404. The first is required by Corepack; the second affects `npm audit signatures` rather than version pinning.
 
-Items 1–2 are what npm's third-party-registry convention describes. Items 3–4 are conformance with documented endpoints and with the behaviour of other npm proxies.
+Items 1–2 are what resolve Issue B. Items 3–4 are conformance with documented endpoints and with the behaviour of other npm proxies.
 
-Items 1 and 2 together resolve Issue B; item 3 resolves Issue A from the feed side. Either the pnpm change or item 3 unblocks version pinning, but only items 1–2 restore signature verification, `npm audit signatures`, and Corepack support.
+Either the pnpm change in Issue A or item 3 unblocks version pinning at the resolution stage, but only items 1–2 allow the signature check to pass, and therefore only items 1–2 restore `npm audit signatures` and Corepack support alongside it.
 
 ---
 
