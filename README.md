@@ -162,6 +162,9 @@ A repository whose lockfile was generated against the public registry passes che
 
 ## 4. Issue A — the non-canonical `dist.tarball` URL
 
+> **Upstream issue:** [pnpm/pnpm#13619](https://github.com/pnpm/pnpm/issues/13619) (open, `regression` / `state: needs design`)  
+> **Introduced by:** [pnpm/pnpm#12296](https://github.com/pnpm/pnpm/pull/12296) — `fix: harden package-manager bootstrap metadata` (`822beb5`), first released in **11.5.3**
+
 ### 4.1 What fails
 
 `assertIntegrityOnlyResolution()` in [`pnpm/src/packageManagerLockfile.ts`](https://github.com/pnpm/pnpm/blob/main/pnpm11/pnpm/src/packageManagerLockfile.ts) requires the resolution object for a package-manager dependency to have **exactly one key**, `integrity`:
@@ -208,6 +211,9 @@ Either change alone resolves Issue A.
 ---
 
 ## 5. Issue B — the stripped `dist.signatures` and `dist.integrity`
+
+> **Upstream issue:** [pnpm/pnpm#13147](https://github.com/pnpm/pnpm/issues/13147) — *"Registries without signatures cannot be used"* (open, `type: bug` / `state: needs design`)  
+> **Introduced by:** [pnpm/pnpm#12292](https://github.com/pnpm/pnpm/pull/12292) — `fix(security): verify npm registry signature before spawning a package-manager binary` (`5f2bb9f`), first released in **11.5.3**, and ported to the 10.x line in **10.34.2**
 
 ### 5.1 What fails
 
@@ -323,33 +329,6 @@ That port deliberately took only *part* of [#12296](https://github.com/pnpm/pnpm
 This is confirmed by the release trees: `v10.34.2` contains `tools/plugin-commands-self-updater/src/verifyPnpmEngineIdentity.ts` but **no** `packageManagerLockfile.ts`, whereas `v11.5.3` contains both. (The ports are re-implementations rather than cherry-picks, so `git tag --contains 5f2bb9f` does not list any 10.x tag.)
 
 The 12.x alpha surfaces a third variant of the same root cause: the missing `dist.integrity` is now a hard error in its own right ([#12394](https://github.com/pnpm/pnpm/pull/12394)), rather than silently degrading to a SHA-1 derived from `shasum`.
-
-### Existing upstream reports
-
-**Issue B is reported upstream:** [pnpm/pnpm#13147 — *"Registries without signatures cannot be used"*](https://github.com/pnpm/pnpm/issues/13147) (open, `type: bug` / `state: needs design`, filed 2026-07-19). It reproduces the identical error against a signature-less registry, notes the same regression window (`v11.5.3`+ and `v10.34.2`+), and pnpm's triage confirms the affected code path as `verifyPnpmEngineIdentity.ts`, with parity work also required in the Rust `pacquet` implementation.
-
-**Issue A does not appear to be reported upstream.** No issue in `pnpm/pnpm` (open or closed) matches the error text, and neither of the two nearest issues covers it:
-
-- [#13534](https://github.com/pnpm/pnpm/issues/13534) — `pnpm install` v10 discards `dist.tarball` on installation (GitHub Enterprise serving non-canonical tarball paths). Same underlying theme, but the ordinary install path, not the package-manager bootstrap.
-- [#13558](https://github.com/pnpm/pnpm/issues/13558) — wrong lockfile tarball registry for same-host multi-path registries (`ERR_PNPM_TARBALL_URL_MISMATCH`). Again the ordinary install path.
-- [#13263](https://github.com/pnpm/pnpm/issues/13263) — `packageManager` resolution ignores the project `.npmrc` registry. This is the other half of [#12296](https://github.com/pnpm/pnpm/pull/12296) (bootstrap reads only trusted config), not the resolution-shape assertion.
-
-It has, however, been hit and worked around in the wild — the error text appears in several unrelated repositories, always in connection with a corporate mirror that rewrites the tarball host. For example [hakula139/nixos-config#120](https://github.com/hakula139/nixos-config/pull/120) diagnoses it precisely:
-
-> pnpm 11 hardened its package-manager self-install: when a repo pins `packageManager` […] pnpm fetches it as `@pnpm/exe` and asserts an **integrity-only** resolution. The artifactory npm mirror rewrites the tarball host to its own domain, so the resolution carries a `tarball` field alongside `integrity` and the assertion throws.
-
-Their workaround was to scope only the `@pnpm` packages to `registry.npmjs.org` while leaving everything else on the mirror. Others resorted to `pmOnFail: ignore` or to pinning a public registry in the project `.npmrc`.
-
-### The two PRs responsible
-
-Both were merged on 2026-06-09 and first shipped in **11.5.3**:
-
-| Issue | PR | Merge commit | What it added |
-| --- | --- | --- | --- |
-| A | [#12296](https://github.com/pnpm/pnpm/pull/12296) — `fix: harden package-manager bootstrap metadata` | [`822beb5`](https://github.com/pnpm/pnpm/commit/822beb5fa0458a041f2833d452f8dc6b59b1f1cd) | `pnpm/src/packageManagerLockfile.ts` (the integrity-only resolution assertion) and `pnpm/src/packageManagerRegistries.ts`, which restricts bootstrap resolution to trusted (non-project) registry and network config |
-| B | [#12292](https://github.com/pnpm/pnpm/pull/12292) — `fix(security): verify npm registry signature before spawning a package-manager binary` | [`5f2bb9f`](https://github.com/pnpm/pnpm/commit/5f2bb9f5ba01d498e03eb54a0d72d185fe3d0aca) | `engine/pm/commands/src/self-updater/verifyPnpmEngineIdentity.ts`, npm's public keys embedded in `deps/security/signatures/src/npmSigningKeys.ts`, and the call site in `installPnpm.ts` |
-
-#12292 addresses a case where a cloned repository controls both the lockfile and the registry the bytes are fetched from, so lockfile integrity alone attests nothing; verification is therefore done against keys the client already holds, and fails closed. #12296 hardens the metadata that feeds that step and prevents a project-level `.npmrc` from steering bootstrap traffic.
 
 ---
 
