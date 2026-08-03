@@ -301,14 +301,44 @@ Global pnpm installed via `npm install -g pnpm@<version>`, run against this repo
 | 9.6.0 | no switch — feature absent, prints `9.6.0` |
 | 9.7.0 | switches to 11.10.0 |
 | 10.0.0 | switches to 11.10.0 |
+| 10.34.1 | switches to 11.10.0 |
+| **10.34.2** | **fails — Issue B**: `Refusing to run pnpm@11.10.0: its npm registry signature could not be verified` |
+| 10.34.5 | fails — same |
 | 11.5.2 | switches to 11.10.0 |
-| **11.5.3** | **fails** — `must use a registry package path and an integrity-only resolution` |
+| **11.5.3** | **fails — Issue A**: `must use a registry package path and an integrity-only resolution` |
 | 11.15.1, 11.16.0 | fails — same |
 | 12.0.0-alpha.18 | fails — `Cannot resolve pnpm@11.10.0 as a package manager dependency because it has no integrity` |
 
-So **9.7.0 through 11.5.2 work behind the proxy; 11.5.3 and later do not.** The same bisection against the underlying `ms-feed-12` feed (where Issue A does not apply) also passes on 9.7.0 / 10.0.0 / 11.5.2 and fails from 11.5.3, confirming both checks arrived together.
+The two release lines fail *differently*, which is useful for telling the issues apart:
+
+- **10.34.2+** fails with **Issue B directly**, because the 10.x line has the signature check but not the Issue A assertion.
+- **11.5.3+** has both checks, and Issue A is evaluated first, so it **masks Issue B** — the signature error never appears. (Isolating Issue B on the 11.x line therefore requires a registry whose tarball URL *is* canonical, such as the underlying `ms-feed-12` feed; there, 9.7.0 / 10.0.0 / 11.5.2 still pass and 11.5.3 fails with the signature error.)
+
+The 10.x and 11.x lines are **parallel maintenance lines, not points on one timeline** — `v10.34.2` and `v11.5.3` were both released on 2026-06-10. Nothing was added in 10.x and later removed: the signature check shipped to both lines the same day, via [#12300](https://github.com/pnpm/pnpm/pull/12300) (`fix(security): port the latest security fixes to v10`).
+
+That port deliberately took only *part* of [#12296](https://github.com/pnpm/pnpm/pull/12296). It applied the trusted-registry/network-config half, but explicitly skipped the env-lockfile validation that produces the Issue A error:
+
+> The env-lockfile validation parts of the main PR (`packageManagerLockfile.ts`, `syncEnvLockfile`, peer-suffix handling) do not apply: v10 bootstraps through a staged child install, which already runs outside the repository's config context.
+
+This is confirmed by the release trees: `v10.34.2` contains `tools/plugin-commands-self-updater/src/verifyPnpmEngineIdentity.ts` but **no** `packageManagerLockfile.ts`, whereas `v11.5.3` contains both. (The ports are re-implementations rather than cherry-picks, so `git tag --contains 5f2bb9f` does not list any 10.x tag.)
 
 The 12.x alpha surfaces a third variant of the same root cause: the missing `dist.integrity` is now a hard error in its own right ([#12394](https://github.com/pnpm/pnpm/pull/12394)), rather than silently degrading to a SHA-1 derived from `shasum`.
+
+### Existing upstream reports
+
+**Issue B is reported upstream:** [pnpm/pnpm#13147 — *"Registries without signatures cannot be used"*](https://github.com/pnpm/pnpm/issues/13147) (open, `type: bug` / `state: needs design`, filed 2026-07-19). It reproduces the identical error against a signature-less registry, notes the same regression window (`v11.5.3`+ and `v10.34.2`+), and pnpm's triage confirms the affected code path as `verifyPnpmEngineIdentity.ts`, with parity work also required in the Rust `pacquet` implementation.
+
+**Issue A does not appear to be reported upstream.** No issue in `pnpm/pnpm` (open or closed) matches the error text, and neither of the two nearest issues covers it:
+
+- [#13534](https://github.com/pnpm/pnpm/issues/13534) — `pnpm install` v10 discards `dist.tarball` on installation (GitHub Enterprise serving non-canonical tarball paths). Same underlying theme, but the ordinary install path, not the package-manager bootstrap.
+- [#13558](https://github.com/pnpm/pnpm/issues/13558) — wrong lockfile tarball registry for same-host multi-path registries (`ERR_PNPM_TARBALL_URL_MISMATCH`). Again the ordinary install path.
+- [#13263](https://github.com/pnpm/pnpm/issues/13263) — `packageManager` resolution ignores the project `.npmrc` registry. This is the other half of [#12296](https://github.com/pnpm/pnpm/pull/12296) (bootstrap reads only trusted config), not the resolution-shape assertion.
+
+It has, however, been hit and worked around in the wild — the error text appears in several unrelated repositories, always in connection with a corporate mirror that rewrites the tarball host. For example [hakula139/nixos-config#120](https://github.com/hakula139/nixos-config/pull/120) diagnoses it precisely:
+
+> pnpm 11 hardened its package-manager self-install: when a repo pins `packageManager` […] pnpm fetches it as `@pnpm/exe` and asserts an **integrity-only** resolution. The artifactory npm mirror rewrites the tarball host to its own domain, so the resolution carries a `tarball` field alongside `integrity` and the assertion throws.
+
+Their workaround was to scope only the `@pnpm` packages to `registry.npmjs.org` while leaving everything else on the mirror. Others resorted to `pmOnFail: ignore` or to pinning a public registry in the project `.npmrc`.
 
 ### The two PRs responsible
 
